@@ -1,0 +1,9 @@
+﻿timestamp,source_image,gesture,action_id,action_desc,mqtt_message
+2026-05-11 16:04:16,hand1.jpg,Open,light_on,打开灯光,"{""device_id"":""edge_camera_01"",""gesture"":""Open"",""action"":""light_on""}"
+2026-05-11 16:20:24,hand_open.jpg,Open,light_on,打开灯光,"{""device_id"":""edge_camera_01"",""gesture"":""Open"",""action"":""light_on""}"
+2026-05-11 16:24:49,hand_close.jpg,Close,light_off,关闭灯光,"{""device_id"":""edge_camera_01"",""gesture"":""Close"",""action"":""light_off""}"
+2026-05-11 16:26:22,hand_point.jpg,Pointer,next_page,下一页,"{""device_id"":""edge_camera_01"",""gesture"":""Pointer"",""action"":""next_page""}"
+2026-05-11 16:27:24,hand_ok.jpg,Open,light_on,打开灯光,"{""device_id"":""edge_camera_01"",""gesture"":""Open"",""action"":""light_on""}"
+2026-05-11 16:35:55,hand1.jpg,Open,light_on,打开灯光,"{""device_id"":""edge_camera_01"",""gesture"":""Open"",""action"":""light_on""}"
+2026-05-11 16:36:41,hand1.jpg,Open,light_on,打开灯光,"{""device_id"":""edge_camera_01"",""gesture"":""Open"",""action"":""light_on""}"
+2026-05-11 16:37:12,hand_top.jpg,Open,light_on,打开灯光,"{""device_id"":""edge_camera_01"",""gesture"":""Open"",""action"":""light_on""}"

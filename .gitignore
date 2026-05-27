@@ -1,0 +1,61 @@
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# macOS/iCloud temp files
+.icloud
+\.icloud/*
+
+# Windows image file cache
+ehthumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+ENV/
+/.venv
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Java/IDE
+.classpath
+.project
+.settings/
+*.iml
+target/
+bin/
+build/
+
+# JetBrains
+.idea/
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+
+# Archives
+*.zip
+*.tar.gz
+*.rar
+
+# Generated files
+dist/
+coverage/
+coverage-final.json
+
+# Ignore secrets and local config
+.env
+*.local
+
+# Keep this gitignore in repo
+!.gitignore
