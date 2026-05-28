@@ -57,5 +57,9 @@ coverage-final.json
 .env
 *.local
 
+# Claude
+.claude/
+
 # Keep this gitignore in repo
 !.gitignore
+

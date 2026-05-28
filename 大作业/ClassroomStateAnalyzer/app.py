@@ -52,7 +52,8 @@ st.set_page_config(
 if "recognizer" not in st.session_state:
     with st.spinner("正在加载表情识别模型..."):
         st.session_state.recognizer = get_recognizer()
-    st.success("✅ 模型加载完成！")
+        st.session_state.recognizer.warm_up()
+    st.success("✅ 模型加载并预热完成！")
 
 if "current_image" not in st.session_state:
     st.session_state.current_image = None
@@ -68,6 +69,8 @@ if "state_level" not in st.session_state:
     st.session_state.state_level = None
 if "result_image" not in st.session_state:
     st.session_state.result_image = None
+if "fast_mode" not in st.session_state:
+    st.session_state.fast_mode = True
 
 
 # ==================== 核心处理函数 ====================
@@ -94,9 +97,13 @@ def process_image(image, image_name=None):
         st.session_state.result_image = image_bgr
         return
     
-    # 2. 表情识别
+    # 2. 表情识别（根据快速模式选择方法）
+    fast = st.session_state.get('fast_mode', True)
     with st.spinner(f"🎭 正在识别 {len(faces)} 张人脸的表情..."):
-        recognition_results = st.session_state.recognizer.recognize_all(image_bgr, faces)
+        if fast:
+            recognition_results = st.session_state.recognizer.recognize_all_fast(image_bgr, faces)
+        else:
+            recognition_results = st.session_state.recognizer.recognize_all(image_bgr, faces)
     
     # 3. 统计
     stats = calculate_statistics(recognition_results)
@@ -152,6 +159,14 @@ with st.sidebar:
     
     # 参数设置
     st.subheader("⚙️ 参数设置")
+    
+    fast_mode = st.checkbox(
+        "⚡ 快速模式",
+        value=st.session_state.fast_mode,
+        help="开启后跳过数据增广，速度提升约 6 倍；关闭则使用增广策略，准确率略高"
+    )
+    st.session_state.fast_mode = fast_mode
+    
     confidence_threshold = st.slider(
         "置信度阈值",
         min_value=0.0,
@@ -287,7 +302,11 @@ elif input_mode == "🎬 视频上传":
                     
                     faces = detect_faces(frame)
                     if len(faces) > 0:
-                        recognition_results = st.session_state.recognizer.recognize_all(frame, faces)
+                        fast = st.session_state.get('fast_mode', True)
+                        if fast:
+                            recognition_results = st.session_state.recognizer.recognize_all_fast(frame, faces)
+                        else:
+                            recognition_results = st.session_state.recognizer.recognize_all(frame, faces)
                         all_results.extend(recognition_results)
                     
                     progress_bar.progress(min(analyzed_count / max_frames, 1.0))
@@ -334,33 +353,92 @@ elif input_mode == "🎬 视频上传":
 
 # ---- 摄像头实时模式 ----
 elif input_mode == "📹 摄像头实时":
-    st.info("📹 摄像头实时检测模式")
+    cam_mode = st.radio(
+        "摄像头模式",
+        ["📸 拍照模式", "🎥 实时流模式"],
+        horizontal=True,
+        help="拍照模式：点击拍照后分析；实时流模式：持续分析视频画面"
+    )
     
-    enable_camera = st.checkbox("开启摄像头", value=False)
-    
-    if enable_camera:
-        camera_placeholder = st.empty()
-        status_placeholder = st.empty()
+    if cam_mode == "📸 拍照模式":
+        st.info("📹 点击下方拍照区域即可捕获画面并自动分析")
         
-        cap = cv2.VideoCapture(0)  # 0 = 默认摄像头
+        camera_photo = st.camera_input("📸 点击此处拍照")
         
-        if not cap.isOpened():
-            st.error("❌ 无法打开摄像头，请检查设备连接")
-        else:
-            if st.button("📸 拍照并分析", type="primary"):
-                ret, frame = cap.read()
-                if ret:
-                    # 转为 RGB 显示
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    camera_placeholder.image(frame_rgb, caption="摄像头画面", use_container_width=True)
-                    
-                    # 处理
-                    process_image(frame, "camera_capture.jpg")
-                    save_current_record()
-                else:
-                    st.error("❌ 无法获取摄像头画面")
+        if camera_photo is not None:
+            image = Image.open(camera_photo)
+            timestamp_str = datetime.now().strftime("camera_%Y%m%d_%H%M%S.jpg")
             
-            cap.release()
+            with st.spinner("🔍 正在分析摄像头拍摄的画面..."):
+                process_image(image, timestamp_str)
+                save_current_record()
+    
+    elif cam_mode == "🎥 实时流模式":
+        st.info("🎥 实时视频流分析，摄像头画面将实时标注人脸和表情")
+        st.warning("⚠️ 实时流模式需要浏览器授权摄像头，且对网络和性能有一定要求")
+        
+        try:
+            from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
+            import av
+            import threading
+            
+            # 线程锁，保护 TF 模型调用
+            _model_lock = threading.Lock()
+            
+            class FaceExpressionProcessor(VideoProcessorBase):
+                """WebRTC 视频处理器：逐帧进行人脸检测和表情识别"""
+                
+                def __init__(self):
+                    self.recognizer = None
+                    self._load_model()
+                
+                def _load_model(self):
+                    """在处理器初始化时加载模型"""
+                    try:
+                        self.recognizer = get_recognizer()
+                        self.recognizer.warm_up()
+                    except Exception as e:
+                        print(f"[WebRTC] 模型加载失败: {e}")
+                
+                def recv(self, frame):
+                    """处理每一帧视频"""
+                    img = frame.to_ndarray(format="bgr24")
+                    
+                    if self.recognizer is None or self.recognizer.model is None:
+                        return av.VideoFrame.from_ndarray(img, format="bgr24")
+                    
+                    try:
+                        with _model_lock:
+                            # 人脸检测
+                            faces = detect_faces(img)
+                            
+                            if len(faces) > 0:
+                                # 快速模式识别
+                                results = self.recognizer.recognize_all_fast(img, faces)
+                                
+                                # 绘制结果
+                                img = draw_results(img, results)
+                    except Exception as e:
+                        print(f"[WebRTC] 帧处理错误: {e}")
+                    
+                    return av.VideoFrame.from_ndarray(img, format="bgr24")
+            
+            webrtc_streamer(
+                key="classroom-webrtc",
+                mode=WebRtcMode.SENDRECV,
+                video_processor_factory=FaceExpressionProcessor,
+                media_stream_constraints={
+                    "video": {"width": 640, "height": 480},
+                    "audio": False,
+                },
+                async_processing=True,
+            )
+            
+        except ImportError:
+            st.error("❌ 缺少 streamlit-webrtc 依赖，请运行: `pip install streamlit-webrtc`")
+        except Exception as e:
+            st.error(f"❌ 实时流启动失败: {e}")
+            st.info("提示：实时流模式需要 HTTPS 或 localhost 环境，远程访问可能不支持")
 
 
 # ==================== 检测结果展示 ====================

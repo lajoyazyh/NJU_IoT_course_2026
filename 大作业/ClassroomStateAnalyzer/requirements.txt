@@ -16,5 +16,8 @@ mediapipe>=0.10.0
 # Web 界面
 streamlit>=1.30.0
 
+# 实时视频流（可选，用于摄像头实时模式）
+streamlit-webrtc>=0.45.0
+
 # 其他
 matplotlib>=3.7.0
