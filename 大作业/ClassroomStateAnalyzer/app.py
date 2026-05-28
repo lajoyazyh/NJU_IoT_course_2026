@@ -86,7 +86,9 @@ def process_image(image, image_name=None):
     
     # 1. 人脸检测
     with st.spinner("🔍 正在检测人脸..."):
-        faces = detect_faces(image_bgr)
+        merge = st.session_state.get('merge_detectors', True)
+        sensitivity = st.session_state.get('detection_sensitivity', 0.3)
+        faces = detect_faces(image_bgr, merge_detectors=merge, min_conf_mediapipe=sensitivity)
     
     if len(faces) == 0:
         st.warning("⚠️ 未检测到人脸，请尝试其他图片。")
@@ -175,6 +177,23 @@ with st.sidebar:
         step=0.05,
         help="低于此置信度的检测结果将被过滤"
     )
+    
+    detection_sensitivity = st.slider(
+        "🔍 人脸检测灵敏度",
+        min_value=0.1,
+        max_value=0.9,
+        value=st.session_state.get('detection_sensitivity', 0.3),
+        step=0.05,
+        help="越低越灵敏（召回率高但可能误检），越高越精确。推荐 0.3 以检测更多侧脸/模糊人脸"
+    )
+    st.session_state.detection_sensitivity = detection_sensitivity
+    
+    merge_detectors = st.checkbox(
+        "🔄 双检测器合并",
+        value=st.session_state.get('merge_detectors', True),
+        help="同时使用 MediaPipe 和 Haar Cascade 检测，合并结果以检测更多人脸"
+    )
+    st.session_state.merge_detectors = merge_detectors
     
     st.markdown("---")
     
@@ -300,7 +319,9 @@ elif input_mode == "🎬 视频上传":
                     analyzed_count += 1
                     status_text.text(f"正在分析第 {analyzed_count} 帧...")
                     
-                    faces = detect_faces(frame)
+                    merge = st.session_state.get('merge_detectors', True)
+                    sensitivity = st.session_state.get('detection_sensitivity', 0.3)
+                    faces = detect_faces(frame, merge_detectors=merge, min_conf_mediapipe=sensitivity)
                     if len(faces) > 0:
                         fast = st.session_state.get('fast_mode', True)
                         if fast:

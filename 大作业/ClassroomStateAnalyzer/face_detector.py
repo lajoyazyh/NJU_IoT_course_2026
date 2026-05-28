@@ -102,34 +102,105 @@ def detect_faces_haar(image_bgr):
     return faces
 
 
-def detect_faces(image_bgr, use_mediapipe=True):
+def compute_iou(box1, box2):
     """
-    检测图像中的所有人脸
+    计算两个边界框的交并比 (IoU)
+    Args:
+        box1: (x1, y1, x2, y2)
+        box2: (x1, y1, x2, y2)
+    Returns:
+        iou: 交并比 (0~1)
+    """
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union_area = area1 + area2 - inter_area
+    
+    return inter_area / union_area if union_area > 0 else 0
+
+
+def nms_faces(faces, iou_threshold=0.4):
+    """
+    非极大值抑制 (NMS) 去除重复检测
+    Args:
+        faces: [(x1, y1, x2, y2, confidence), ...]
+        iou_threshold: IoU 阈值，高于此值视为重复
+    Returns:
+        filtered_faces: 去重后的人脸列表
+    """
+    if len(faces) == 0:
+        return []
+    
+    # 按置信度降序排列
+    faces_sorted = sorted(faces, key=lambda x: x[4], reverse=True)
+    keep = []
+    
+    for face in faces_sorted:
+        duplicate = False
+        for kept_face in keep:
+            if compute_iou(face[:4], kept_face[:4]) > iou_threshold:
+                duplicate = True
+                break
+        if not duplicate:
+            keep.append(face)
+    
+    return keep
+
+
+def detect_faces(image_bgr, use_mediapipe=True, merge_detectors=True, min_conf_mediapipe=0.3):
+    """
+    检测图像中的所有人脸（双检测器合并策略）
     Args:
         image_bgr: BGR 格式的 numpy 图像数组
-        use_mediapipe: 是否优先使用 MediaPipe
+        use_mediapipe: 是否启用 MediaPipe
+        merge_detectors: 是否合并两个检测器的结果（推荐 True，提高召回率）
+        min_conf_mediapipe: MediaPipe 最低置信度阈值
     Returns:
         faces: [(x1, y1, x2, y2, confidence), ...]
     """
     if image_bgr is None or image_bgr.size == 0:
         return []
     
-    faces = []
+    mp_faces = []
+    haar_faces = []
     
+    # 1. MediaPipe 检测
     if use_mediapipe:
         try:
-            faces = detect_faces_mediapipe(image_bgr)
+            # 使用传入的置信度阈值
+            global _mp_face_detection, _mp_face_detector
+            if _mp_face_detection is not None:
+                # 重新创建检测器以使用新的置信度阈值
+                _mp_face_detector = _mp_face_detection.FaceDetection(
+                    model_selection=1,
+                    min_detection_confidence=min_conf_mediapipe
+                )
+            mp_faces = detect_faces_mediapipe(image_bgr)
         except Exception as e:
-            print(f"[face_detector] MediaPipe 检测失败: {e}，回退到 Haar Cascade")
+            print(f"[face_detector] MediaPipe 检测失败: {e}")
     
-    # MediaPipe 未检测到人脸或出错时，回退到 Haar
-    if len(faces) == 0:
-        try:
-            faces = detect_faces_haar(image_bgr)
-        except Exception as e:
-            print(f"[face_detector] Haar Cascade 检测失败: {e}")
+    # 2. Haar Cascade 检测
+    try:
+        haar_faces = detect_faces_haar(image_bgr)
+    except Exception as e:
+        print(f"[face_detector] Haar Cascade 检测失败: {e}")
     
-    return faces
+    # 3. 合并策略
+    if merge_detectors:
+        # 合并两个检测器的结果，用 NMS 去重
+        all_faces = mp_faces + haar_faces
+        faces = nms_faces(all_faces, iou_threshold=0.4)
+        return faces
+    else:
+        # 旧逻辑：MediaPipe 优先，检测不到才用 Haar
+        if len(mp_faces) > 0:
+            return mp_faces
+        return haar_faces
 
 
 def crop_face(image_bgr, face_bbox, margin=10):
