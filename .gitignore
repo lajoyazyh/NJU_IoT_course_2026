@@ -62,4 +62,5 @@ coverage-final.json
 
 # Keep this gitignore in repo
 !.gitignore
+*.csv
 
