@@ -42,8 +42,9 @@
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | 📷 **图片上传识别** | 上传多人图片，自动检测+识别+统计 | ✅ 已实现 |
-| 🎬 **视频上传分析** | 上传视频，抽帧分析并汇总统计 | ✅ 已实现 |
-| 📹 **摄像头实时识别** | 浏览器端拍照 + WebRTC 实时流双模式 | ✅ 已实现 |
+| 🎬 **视频上传分析** | 上传视频，按时间采样，输出整体统计与时序分析 | ✅ 已实现 |
+| ⏱️ **课堂状态时序分析** | 逐帧记录表情比例，生成趋势图、三级预警和时序 CSV | ✅ 已实现 |
+| 📹 **摄像头实时识别** | 拍照模式 + OpenCV 本地实时模式 + WebRTC 实验模式 | ✅ 已实现 |
 | 🎭 **多人人脸检测** | MediaPipe + Haar Cascade 双检测器，支持多人 | ✅ 已实现 |
 | 😀 **7 类表情识别** | Angry/Disgust/Fear/Happy/Sad/Surprise/Neutral | ✅ 已实现 |
 | 📊 **表情分布统计** | 各类表情人数、比例、柱状图 | ✅ 已实现 |
@@ -53,6 +54,7 @@
 | 👤 **单人识别详情** | 每个人脸的独立识别结果和置信度 | ✅ 已实现 |
 | 📈 **历史趋势图** | 历史检测记录的表情变化趋势 | ✅ 已实现 |
 | 📤 **CSV 导出** | 导出完整检测记录 CSV | ✅ 已实现 |
+| ⚡ **性能统计** | 显示视频分析总耗时、平均每帧耗时和人脸实例数 | ✅ 已实现 |
 
 ---
 
@@ -66,6 +68,8 @@ ClassroomStateAnalyzer/
 ├── face_detector.py             # 人脸检测模块（MediaPipe + Haar Cascade）
 ├── expression_recognizer.py     # 表情识别模块（CNN3 模型）
 ├── analyzer.py                  # 表情统计与课堂状态分析模块
+├── pipeline.py                  # 单帧分析管线（检测→识别→统计→绘图）
+├── temporal_analyzer.py         # 视频时序分析与预警模块
 ├── utils.py                     # 工具函数（标注、导出、CSV 等）
 ├── models/
 │   └── cnn3_best_weights.h5    # CNN3 预训练模型权重（来自实验二）
@@ -87,28 +91,32 @@ ClassroomStateAnalyzer/
 | `face_detector.py` | 多人人脸检测，支持 MediaPipe 和 Haar Cascade 双检测器 | `detect_faces(image)` → 人脸框列表 |
 | `expression_recognizer.py` | 加载 CNN3 模型，对裁剪的人脸进行 7 类表情识别 | `recognizer.recognize_all(image, faces)` → 识别结果列表 |
 | `analyzer.py` | 表情统计计算、课堂状态判断、格式化输出 | `calculate_statistics(results)`, `judge_classroom_state(stats)` |
+| `pipeline.py` | 统一单帧分析流程，供图片、视频、摄像头复用 | `analyze_frame(frame, recognizer, config)` |
+| `temporal_analyzer.py` | 视频采样、逐帧统计、滑动窗口预警、性能统计 | `analyze_video(video_path, recognizer, config)` |
 | `utils.py` | 中文标注绘制、结果图片保存、CSV 读写导出 | `draw_results()`, `save_record()`, `load_records()` |
-| `app.py` | Streamlit 可视化界面，整合所有模块 | `streamlit run app.py` |
+| `app.py` | Streamlit 可视化界面，只负责输入、调用模块和展示结果 | `streamlit run app.py` |
 
 ### 数据流
 
 ```
 用户上传图片/视频/摄像头
         ↓
-    app.py（Streamlit 界面）
+    app.py（Streamlit 输入与展示）
+        ↓
+    pipeline.analyze_frame()  ←  AnalysisConfig 参数
         ↓
     face_detector.detect_faces()  →  人脸框列表
         ↓
-    expression_recognizer.recognize_all()  →  每个人脸的识别结果
+    expression_recognizer.recognize_all_fast()  →  表情识别结果
         ↓
-    analyzer.calculate_statistics()  →  统计信息
+    analyzer.calculate_statistics() / judge_classroom_state()
         ↓
-    analyzer.judge_classroom_state()  →  课堂状态
+    utils.draw_results()  →  标注图
         ↓
-    utils.draw_results()  →  标注后的图片
-    utils.save_record()   →  CSV 记录
-        ↓
-    Streamlit 界面展示（图片 + 统计 + 图表 + 状态）
+    Streamlit 界面展示（图片 + 统计 + 图表 + 状态 + 记录）
+
+视频模式会在 `temporal_analyzer.py` 中循环调用 `pipeline.analyze_frame()`，
+形成逐帧时序记录、趋势图、预警结果和时序 CSV 日志。
 ```
 
 ---
@@ -227,21 +235,33 @@ pip install protobuf>=3.20.0
 1. 在左侧侧边栏选择 **"🎬 视频上传"**
 2. 上传一段课堂视频（支持 MP4/AVI/MOV/MKV）
 3. 设置采样参数：
-   - **采样帧间隔**：每 N 帧采样一次（默认 30，即约每秒 1 帧）
+   - **采样间隔（秒）**：默认 1 秒 1 帧，符合时序分析任务要求
    - **最大采样帧数**：最多分析多少帧（默认 20）
 4. 点击 **"🔍 开始视频分析"**
 5. 系统将逐帧分析并汇总统计，显示进度条
+6. 分析完成后显示：
+   - 视频概览：采样帧数、平均每帧人数、峰值人数、人脸实例数
+   - 按帧平均表情比例与课堂状态
+   - 表情比例随时间变化的折线图
+   - 三级预警结果与触发原因
+   - 关键采样帧预览
+   - 分析帧数、总耗时、平均每帧耗时
+   - 导出的 `results/temporal_*.csv` 时序日志路径
 
-### 5.3 摄像头实时模式（双模式）
+> **统计口径说明**：视频中同一名学生会在多个采样帧中重复出现，因此系统不把跨帧累计值称为“检测人数”。视频报告使用“平均每帧人数”“峰值人数”和“人脸实例数”描述规模，表情分布使用各采样帧比例的平均值。
+
+### 5.3 摄像头实时模式（三模式）
 
 1. 在左侧侧边栏选择 **"📹 摄像头实时"**
 2. 选择摄像头模式：
    - **📸 拍照模式**：点击拍照区域捕获画面，自动分析（推荐，零延迟）
-   - **🎥 实时流模式**：WebRTC 实时视频流，画面持续标注人脸和表情（进阶）
+   - **🖥️ 本地实时模式**：使用 OpenCV 直接读取本机摄像头，连续显示并分析画面（推荐用于课堂演示）
+   - **🎥 实时流模式**：WebRTC 浏览器视频流，画面持续标注人脸和表情（实验性）
 3. 拍照模式下，点击摄像头区域拍照后自动完成检测
-4. 实时流模式下，点击"Start"开启实时分析
+4. 本地实时模式下，设置摄像头编号、运行时长和分析间隔后，点击"启动本地实时分析"
+5. 实时流模式下，点击"Start"开启实时分析
 
-> **注意**：实时流模式需要浏览器授权摄像头，且对网络和性能有一定要求。需要在 HTTPS 或 localhost 环境下运行。
+> **注意**：WebRTC 实时流模式需要浏览器授权摄像头，且对网络和性能有一定要求。若出现 `Connection is taking longer than expected`，优先使用本地实时模式或拍照模式完成演示。
 
 ### 5.4 参数设置
 
@@ -252,9 +272,16 @@ pip install protobuf>=3.20.0
 
 | 按钮 | 功能 | 输出 |
 |------|------|------|
-| 💾 保存记录 | 将当前检测结果保存到 `records.csv` | CSV 文件 |
+| 💾 保存记录 | 将当前检测结果保存到 `records.csv`，用于历史趋势查看 | CSV 文件 |
 | 📊 导出 CSV | 导出所有历史检测记录 | CSV 文件 |
-| 🖼️ 导出结果图片 | 保存标注后的检测结果图片 | JPG 图片（保存到 `results/` 目录） |
+| 📦 保存当前结果包 | 按输入模态保存完整分析产物 | `results/` 下的结果目录 |
+| ⬇️ 下载当前结果包 | 将刚保存的结果包打包下载 | ZIP 文件 |
+
+结果包会根据输入类型自动调整内容：
+
+- 图片/拍照/本地实时摄像头：保存标注后的 `annotated_result.jpg`、统计摘要 `summary.json`、单个人脸识别明细 `face_details.csv`。
+- 视频：保存 `video_summary.json`、逐帧时序日志 `temporal_records.csv`、关键采样帧图片。
+- 历史记录 `records.csv` 只保留轻量摘要；完整证据材料放在结果包中，避免把视频时序数据和单帧图片记录混在一起。
 
 ---
 
@@ -338,7 +365,46 @@ state_text, state_level = judge_classroom_state(stats)
 # → ("课堂状态良好 😊", "good")
 ```
 
-### 6.4 `utils.py` — 工具函数
+同时提供 `calculate_temporal_warning(frame_records)`，用于视频时序分析中的三级预警：
+
+| 等级 | 触发条件 |
+|------|----------|
+| 绿色状态 | 连续 10 个采样帧课堂状态良好 |
+| 黄色预警 | 连续 5 个采样帧平稳但 Neutral 占比偏高 |
+| 红色预警 | 连续 3 个采样帧低落或注意力波动 |
+
+### 6.4 `pipeline.py` — 单帧分析管线
+
+`pipeline.py` 把单张图像的核心处理流程封装成一个统一接口，图片、视频采样帧、摄像头帧和 WebRTC 帧都会复用它：
+
+```python
+from pipeline import AnalysisConfig, analyze_frame
+
+config = AnalysisConfig(
+    fast_mode=True,
+    confidence_threshold=0.3,
+    detection_sensitivity=0.3,
+    merge_detectors=True,
+)
+
+analysis = analyze_frame(frame_bgr, recognizer, config)
+```
+
+返回结果包括人脸框、过滤前/后的识别结果、统计信息、课堂状态、标注图片和单帧耗时。
+
+### 6.5 `temporal_analyzer.py` — 视频时序分析模块
+
+`temporal_analyzer.py` 负责视频采样、逐帧分析、整体汇总、滑动窗口预警和性能统计：
+
+```python
+from temporal_analyzer import analyze_video
+
+result = analyze_video(video_path, recognizer, config, sample_every_seconds=1.0)
+```
+
+输出包含整体识别结果、逐帧记录、预警信息、性能指标和最后一帧标注图。
+
+### 6.6 `utils.py` — 工具函数
 
 ```python
 from utils import draw_results, save_result_image, save_record, load_records, export_csv
@@ -352,11 +418,14 @@ path = save_result_image(result_img, "class1.jpg")
 # 保存/读取 CSV 记录
 save_record(record_dict)
 df = load_records()
+
+# 导出视频时序日志
+temporal_path = export_temporal_csv(frame_records, "class_video.mp4")
 ```
 
-### 6.5 `app.py` — Streamlit 界面
+### 6.7 `app.py` — Streamlit 界面
 
-Streamlit 应用入口，整合所有模块，提供交互式 Web 界面。
+Streamlit 应用入口，只负责接收用户输入、调用分析模块并展示结果。
 
 **启动命令**：`streamlit run app.py`
 
@@ -386,7 +455,9 @@ Streamlit 应用入口，整合所有模块，提供交互式 Web 界面。
 | 可视化界面 | **Streamlit** | 大作业推荐方案，开发效率高，内置文件上传、图表、布局组件 |
 | 数据记录 | **CSV**（Pandas 读写） | 实现简单，符合要求，Excel 可直接打开 |
 | 中文标注 | **PIL + SimSun 字体** | OpenCV 不支持中文，通过 PIL 绘制中文文本后转回 |
-| 实时视频流 | **streamlit-webrtc**（WebRTC） | 浏览器端实时采集摄像头，服务端逐帧处理并返回标注结果 |
+| 单帧管线 | **pipeline.py** | 统一图片、视频帧、摄像头帧的核心处理流程 |
+| 视频时序 | **temporal_analyzer.py** | 实现采样、趋势、滑动窗口预警和速度统计 |
+| 摄像头实时 | **OpenCV 本地实时模式为主，WebRTC 为实验模式** | 本地模式更适合课程演示，WebRTC 受浏览器和网络影响较大 |
 | 性能优化 | **批量预测 + 模型预热** | 快速模式跳过增广提速 6 倍；预热消除 TF 冷启动延迟 |
 
 ---
@@ -414,7 +485,7 @@ Streamlit 应用入口，整合所有模块，提供交互式 Web 界面。
 3. **侧脸检测**：MediaPipe 对侧脸检测效果较弱，Haar Cascade 回退可能提升覆盖率
 4. **实时性能**：CPU 模式下视频分析速度较慢，GPU 可显著加速
 5. **多人重叠**：人群密集时人脸重叠可能导致漏检
-6. **延展任务**：时序分析（滑动窗口、三级预警）尚未实现，可作为后续扩展
+6. **WebRTC 实时流**：受浏览器安全策略和网络环境影响，推荐课堂演示时优先使用本地实时模式
 
 ---
 

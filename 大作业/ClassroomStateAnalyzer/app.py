@@ -10,6 +10,7 @@ import pandas as pd
 from datetime import datetime
 from PIL import Image
 import tempfile
+import time
 
 import streamlit as st
 
@@ -20,24 +21,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 # 导入自定义模块
-from face_detector import detect_faces
 from expression_recognizer import get_recognizer
 from analyzer import (
-    calculate_statistics,
-    judge_classroom_state,
     get_state_color,
     EXPRESSION_CATEGORIES,
     EXPRESSION_CN_MAP,
-    format_stats_for_display,
     format_record_for_csv,
 )
+from pipeline import AnalysisConfig, analyze_frame
+from temporal_analyzer import analyze_video
 from utils import (
-    draw_results,
-    save_result_image,
     save_record,
     load_records,
     get_records_summary,
     export_csv,
+    export_temporal_csv,
+    export_frame_report,
+    export_video_report,
+    make_zip_bytes,
 )
 
 # 页面配置
@@ -71,9 +72,59 @@ if "result_image" not in st.session_state:
     st.session_state.result_image = None
 if "fast_mode" not in st.session_state:
     st.session_state.fast_mode = True
+if "temporal_records" not in st.session_state:
+    st.session_state.temporal_records = None
+if "temporal_warning" not in st.session_state:
+    st.session_state.temporal_warning = None
+if "video_performance" not in st.session_state:
+    st.session_state.video_performance = None
+if "temporal_csv_path" not in st.session_state:
+    st.session_state.temporal_csv_path = None
+if "result_mode" not in st.session_state:
+    st.session_state.result_mode = None
+if "video_summary" not in st.session_state:
+    st.session_state.video_summary = None
+if "video_keyframes" not in st.session_state:
+    st.session_state.video_keyframes = None
+if "last_export_bundle" not in st.session_state:
+    st.session_state.last_export_bundle = None
 
 
 # ==================== 核心处理函数 ====================
+def get_analysis_config():
+    """从侧边栏状态构造统一分析配置。"""
+    return AnalysisConfig(
+        fast_mode=st.session_state.get('fast_mode', True),
+        confidence_threshold=st.session_state.get('confidence_threshold', 0.3),
+        detection_sensitivity=st.session_state.get('detection_sensitivity', 0.3),
+        merge_detectors=st.session_state.get('merge_detectors', True),
+    )
+
+
+def apply_analysis_to_session(analysis, image_bgr, image_name=None):
+    """把一次单帧分析结果写入 session_state，供统一结果区展示。"""
+    st.session_state.recognition_results = analysis["recognition_results"]
+    st.session_state.stats = analysis["stats"]
+    st.session_state.state_text = analysis["state_text"]
+    st.session_state.state_level = analysis["state_level"]
+    st.session_state.result_image = analysis["result_image"]
+    st.session_state.current_image = image_bgr
+    st.session_state.current_image_name = image_name
+    st.session_state.result_mode = "frame"
+    st.session_state.last_export_bundle = None
+
+
+def clear_temporal_session():
+    """清空上一次视频时序结果，避免不同输入模式互相污染。"""
+    st.session_state.temporal_records = None
+    st.session_state.temporal_warning = None
+    st.session_state.video_performance = None
+    st.session_state.temporal_csv_path = None
+    st.session_state.video_summary = None
+    st.session_state.video_keyframes = None
+    st.session_state.last_export_bundle = None
+
+
 def process_image(image, image_name=None):
     """
     处理单张图片：人脸检测 + 表情识别 + 统计 + 状态判断
@@ -84,46 +135,16 @@ def process_image(image, image_name=None):
     else:
         image_bgr = image
     
-    # 1. 人脸检测
-    with st.spinner("🔍 正在检测人脸..."):
-        merge = st.session_state.get('merge_detectors', True)
-        sensitivity = st.session_state.get('detection_sensitivity', 0.3)
-        faces = detect_faces(image_bgr, merge_detectors=merge, min_conf_mediapipe=sensitivity)
-    
-    if len(faces) == 0:
+    with st.spinner("🔍 正在检测人脸并识别表情..."):
+        analysis = analyze_frame(image_bgr, st.session_state.recognizer, get_analysis_config())
+
+    if len(analysis["faces"]) == 0:
         st.warning("⚠️ 未检测到人脸，请尝试其他图片。")
-        st.session_state.recognition_results = []
-        st.session_state.stats = None
-        st.session_state.state_text = "未检测到学生"
-        st.session_state.state_level = "empty"
-        st.session_state.result_image = image_bgr
-        return
-    
-    # 2. 表情识别（根据快速模式选择方法）
-    fast = st.session_state.get('fast_mode', True)
-    with st.spinner(f"🎭 正在识别 {len(faces)} 张人脸的表情..."):
-        if fast:
-            recognition_results = st.session_state.recognizer.recognize_all_fast(image_bgr, faces)
-        else:
-            recognition_results = st.session_state.recognizer.recognize_all(image_bgr, faces)
-    
-    # 3. 统计
-    stats = calculate_statistics(recognition_results)
-    
-    # 4. 课堂状态判断
-    state_text, state_level = judge_classroom_state(stats)
-    
-    # 5. 绘制结果
-    result_image = draw_results(image_bgr, recognition_results)
-    
-    # 保存到 session
-    st.session_state.recognition_results = recognition_results
-    st.session_state.stats = stats
-    st.session_state.state_text = state_text
-    st.session_state.state_level = state_level
-    st.session_state.result_image = result_image
-    st.session_state.current_image = image_bgr
-    st.session_state.current_image_name = image_name
+    elif len(analysis["recognition_results"]) == 0:
+        st.warning("⚠️ 检测到人脸，但识别置信度低于当前阈值，未纳入统计。")
+
+    clear_temporal_session()
+    apply_analysis_to_session(analysis, image_bgr, image_name)
 
 
 def save_current_record():
@@ -141,6 +162,35 @@ def save_current_record():
     )
     
     return save_record(record)
+
+
+def save_current_result_package():
+    """按当前输入模态导出完整结果包。"""
+    result_mode = st.session_state.get("result_mode")
+
+    if result_mode == "video" and st.session_state.temporal_records:
+        return export_video_report(
+            video_name=st.session_state.current_image_name,
+            video_summary=st.session_state.video_summary,
+            frame_records=st.session_state.temporal_records,
+            warning=st.session_state.temporal_warning,
+            performance=st.session_state.video_performance,
+            keyframes=st.session_state.video_keyframes,
+        )
+
+    if st.session_state.result_image is not None:
+        source_name = str(st.session_state.current_image_name or "")
+        mode = "camera" if "camera" in source_name else "image"
+        return export_frame_report(
+            result_image=st.session_state.result_image,
+            source_name=st.session_state.current_image_name,
+            stats=st.session_state.stats,
+            recognition_results=st.session_state.recognition_results,
+            state_text=st.session_state.state_text,
+            mode=mode,
+        )
+
+    return None
 
 
 # ==================== 侧边栏 ====================
@@ -177,6 +227,7 @@ with st.sidebar:
         step=0.05,
         help="低于此置信度的检测结果将被过滤"
     )
+    st.session_state.confidence_threshold = confidence_threshold
     
     detection_sensitivity = st.slider(
         "🔍 人脸检测灵敏度",
@@ -220,16 +271,34 @@ with st.sidebar:
             else:
                 st.warning("暂无记录可导出")
     
-    # 导出检测结果图片
-    if st.button("🖼️ 导出结果图片", use_container_width=True):
-        if st.session_state.result_image is not None:
-            path = save_result_image(
-                st.session_state.result_image,
-                st.session_state.current_image_name
-            )
-            st.success(f"结果图片已保存到: {path}")
+    # 保存/下载当前结果包：图片/摄像头保存单帧报告，视频保存时序报告。
+    if st.button("📦 保存当前结果包", use_container_width=True):
+        if st.session_state.recognition_results is not None:
+            try:
+                bundle = save_current_result_package()
+                if bundle:
+                    st.session_state.last_export_bundle = bundle
+                    st.success(f"结果包已保存到: {bundle['artifact_dir']}")
+                else:
+                    st.warning("当前结果暂无可保存内容")
+            except Exception as e:
+                st.error(f"保存结果包失败: {e}")
         else:
             st.warning("请先完成检测")
+
+    bundle = st.session_state.get("last_export_bundle")
+    if bundle and bundle.get("paths"):
+        zip_name = os.path.basename(bundle["artifact_dir"]) + ".zip"
+        try:
+            st.download_button(
+                "⬇️ 下载当前结果包",
+                data=make_zip_bytes(bundle["paths"]),
+                file_name=zip_name,
+                mime="application/zip",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.error(f"生成结果包下载失败: {e}")
     
     st.markdown("---")
     st.caption("© 2025 物联网应用软件开发 · 大作业")
@@ -280,12 +349,13 @@ elif input_mode == "🎬 视频上传":
         
         col1, col2 = st.columns(2)
         with col1:
-            frame_interval = st.number_input(
-                "采样帧间隔（每 N 帧采样一次）",
-                min_value=1,
-                max_value=100,
-                value=30,
-                help="值越小采样越密集"
+            sample_every_seconds = st.number_input(
+                "采样间隔（秒）",
+                min_value=0.2,
+                max_value=10.0,
+                value=1.0,
+                step=0.2,
+                help="默认约 1 秒 1 帧，符合时序分析任务要求"
             )
         with col2:
             max_frames = st.number_input(
@@ -297,74 +367,54 @@ elif input_mode == "🎬 视频上传":
             )
         
         if st.button("🔍 开始视频分析", type="primary"):
-            cap = cv2.VideoCapture(video_path)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            
-            st.info(f"视频信息: {total_frames} 帧, {fps:.1f} FPS")
-            
-            all_results = []
-            frame_count = 0
-            analyzed_count = 0
-            
+            clear_temporal_session()
             progress_bar = st.progress(0)
             status_text = st.empty()
-            
-            while cap.isOpened() and analyzed_count < max_frames:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                if frame_count % frame_interval == 0:
-                    analyzed_count += 1
-                    status_text.text(f"正在分析第 {analyzed_count} 帧...")
-                    
-                    merge = st.session_state.get('merge_detectors', True)
-                    sensitivity = st.session_state.get('detection_sensitivity', 0.3)
-                    faces = detect_faces(frame, merge_detectors=merge, min_conf_mediapipe=sensitivity)
-                    if len(faces) > 0:
-                        fast = st.session_state.get('fast_mode', True)
-                        if fast:
-                            recognition_results = st.session_state.recognizer.recognize_all_fast(frame, faces)
-                        else:
-                            recognition_results = st.session_state.recognizer.recognize_all(frame, faces)
-                        all_results.extend(recognition_results)
-                    
-                    progress_bar.progress(min(analyzed_count / max_frames, 1.0))
-                
-                frame_count += 1
-            
-            cap.release()
-            
-            # 汇总统计
-            if len(all_results) > 0:
-                stats = calculate_statistics(all_results)
-                state_text, state_level = judge_classroom_state(stats)
-                
-                st.session_state.recognition_results = all_results
-                st.session_state.stats = stats
-                st.session_state.state_text = state_text
-                st.session_state.state_level = state_level
+
+            def update_video_progress(analyzed_count, max_count):
+                status_text.text(f"正在分析第 {analyzed_count} 个采样帧...")
+                progress_bar.progress(min(analyzed_count / max_count, 1.0))
+
+            result = analyze_video(
+                video_path,
+                st.session_state.recognizer,
+                get_analysis_config(),
+                sample_every_seconds=float(sample_every_seconds),
+                max_frames=int(max_frames),
+                progress_callback=update_video_progress,
+            )
+            performance = result["performance"]
+            st.info(
+                f"视频信息: {performance['total_video_frames']} 帧, "
+                f"{performance['fps']:.1f} FPS, "
+                f"采样间隔 {performance['sample_interval_frames']} 帧"
+            )
+
+            if result["frame_records"]:
+                st.session_state.recognition_results = result["overall_results"]
+                st.session_state.stats = result["video_summary"]["video_stats"]
+                st.session_state.state_text = result["state_text"]
+                st.session_state.state_level = result["state_level"]
+                st.session_state.current_image = None
                 st.session_state.current_image_name = uploaded_video.name
-                
-                # 对最后一帧进行可视化
-                cap2 = cv2.VideoCapture(video_path)
-                last_frame = None
-                while cap2.isOpened():
-                    ret, frame = cap2.read()
-                    if not ret:
-                        break
-                    last_frame = frame
-                cap2.release()
-                
-                if last_frame is not None:
-                    faces_last = detect_faces(last_frame)
-                    if len(faces_last) > 0:
-                        rec_last = st.session_state.recognizer.recognize_all(last_frame, faces_last)
-                        st.session_state.result_image = draw_results(last_frame, rec_last)
-                
+                st.session_state.result_image = None
+                st.session_state.temporal_records = result["frame_records"]
+                st.session_state.temporal_warning = result["warning"]
+                st.session_state.video_performance = performance
+                st.session_state.video_summary = result["video_summary"]
+                st.session_state.video_keyframes = result["keyframes"]
+                st.session_state.result_mode = "video"
+                st.session_state.temporal_csv_path = export_temporal_csv(
+                    result["frame_records"],
+                    uploaded_video.name,
+                )
+
                 save_current_record()
-                status_text.text(f"✅ 分析完成！共分析 {analyzed_count} 帧，检测到 {len(all_results)} 个人脸实例")
+                status_text.text(
+                    f"✅ 分析完成！共分析 {performance['analyzed_frames']} 个采样帧，"
+                    f"平均每帧 {performance['avg_people_per_frame']} 人，"
+                    f"共 {performance['face_instances']} 个人脸实例"
+                )
             else:
                 st.warning("⚠️ 视频中未检测到人脸")
             
@@ -376,9 +426,9 @@ elif input_mode == "🎬 视频上传":
 elif input_mode == "📹 摄像头实时":
     cam_mode = st.radio(
         "摄像头模式",
-        ["📸 拍照模式", "🎥 实时流模式"],
+        ["📸 拍照模式", "🖥️ 本地实时模式", "🎥 实时流模式"],
         horizontal=True,
-        help="拍照模式：点击拍照后分析；实时流模式：持续分析视频画面"
+        help="拍照模式：点击拍照后分析；本地实时模式：用 OpenCV 直接读取本机摄像头；实时流模式：WebRTC 浏览器视频流"
     )
     
     if cam_mode == "📸 拍照模式":
@@ -393,10 +443,136 @@ elif input_mode == "📹 摄像头实时":
             with st.spinner("🔍 正在分析摄像头拍摄的画面..."):
                 process_image(image, timestamp_str)
                 save_current_record()
+
+    elif cam_mode == "🖥️ 本地实时模式":
+        st.info("🖥️ 本地实时模式不使用 WebRTC，直接由 Python/OpenCV 读取本机摄像头，适合课堂演示")
+        st.caption("如果打开失败，请关闭拍照模式预览、微信、腾讯会议或其他占用摄像头的软件后重试。")
+
+        col_cam1, col_cam2, col_cam3 = st.columns(3)
+        with col_cam1:
+            camera_index = st.number_input(
+                "摄像头编号",
+                min_value=0,
+                max_value=5,
+                value=0,
+                step=1,
+                help="通常内置摄像头为 0；如果打不开可尝试 1 或 2"
+            )
+        with col_cam2:
+            run_seconds = st.number_input(
+                "运行时长（秒）",
+                min_value=3,
+                max_value=60,
+                value=15,
+                step=1,
+                help="避免长时间循环阻塞 Streamlit 页面"
+            )
+        with col_cam3:
+            analyze_interval = st.number_input(
+                "分析间隔（帧）",
+                min_value=1,
+                max_value=30,
+                value=5,
+                step=1,
+                help="值越小越实时，但 CPU 压力越大"
+            )
+
+        if st.button("▶️ 启动本地实时分析", type="primary"):
+            clear_temporal_session()
+            cap = cv2.VideoCapture(int(camera_index), cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(int(camera_index))
+
+            if not cap.isOpened():
+                st.error("❌ 无法打开本机摄像头。请确认摄像头编号正确，且没有被其他程序占用。")
+            else:
+                frame_area = st.empty()
+                stats_area = st.empty()
+                progress_bar = st.progress(0)
+
+                start_time = time.time()
+                frame_count = 0
+                last_results = []
+                last_stats = None
+                last_state_text = None
+                last_state_level = None
+                last_frame = None
+                last_result_image = None
+
+                try:
+                    while time.time() - start_time < float(run_seconds):
+                        ret, frame = cap.read()
+                        if not ret:
+                            stats_area.warning("⚠️ 摄像头读取失败，已停止。")
+                            break
+
+                        display_frame = frame
+
+                        if frame_count % int(analyze_interval) == 0:
+                            analysis = analyze_frame(
+                                frame,
+                                st.session_state.recognizer,
+                                get_analysis_config(),
+                            )
+                            last_results = analysis["recognition_results"]
+                            last_stats = analysis["stats"]
+                            last_state_text = analysis["state_text"]
+                            last_state_level = analysis["state_level"]
+                            last_result_image = analysis["result_image"]
+
+                        if last_result_image is not None:
+                            display_frame = last_result_image
+
+                        last_frame = frame
+                        frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                        frame_area.image(frame_rgb, caption="本地实时检测画面", use_container_width=True)
+
+                        if last_stats is not None and last_state_text is not None:
+                            stats_area.info(
+                                f"检测人数: {last_stats['total_count']} | "
+                                f"主要表情: {last_stats['main_expression_cn']} | "
+                                f"课堂状态: {last_state_text}"
+                            )
+
+                        elapsed = time.time() - start_time
+                        progress_bar.progress(min(elapsed / float(run_seconds), 1.0))
+                        frame_count += 1
+                        time.sleep(0.03)
+                finally:
+                    cap.release()
+                    progress_bar.empty()
+
+                if last_stats is not None:
+                    st.session_state.recognition_results = last_results
+                    st.session_state.stats = last_stats
+                    st.session_state.state_text = last_state_text
+                    st.session_state.state_level = last_state_level
+                    st.session_state.current_image = last_frame
+                    st.session_state.current_image_name = datetime.now().strftime("local_camera_%Y%m%d_%H%M%S.jpg")
+                    st.session_state.result_image = last_result_image
+                    st.session_state.result_mode = "frame"
+                    save_current_record()
+                    st.success("✅ 本地实时分析已完成，最后一次检测结果已保存到历史记录。")
     
     elif cam_mode == "🎥 实时流模式":
         st.info("🎥 实时视频流分析，摄像头画面将实时标注人脸和表情")
         st.warning("⚠️ 实时流模式需要浏览器授权摄像头，且对网络和性能有一定要求")
+        st.caption(
+            "建议使用 Chrome 或 Edge 打开 http://localhost:8501 或 "
+            "http://127.0.0.1:8501。若浏览器地址栏左侧摄像头权限不是“允许”，"
+            "请改为允许后刷新页面；如果摄像头被微信、腾讯会议或其他标签页占用，"
+            "请关闭占用程序后重试。本机演示默认使用本地直连；若实时流仍连接较慢，"
+            "可使用拍照模式完成演示。"
+        )
+        use_stun = st.checkbox(
+            "🌐 启用 STUN 服务器（远程/局域网访问时再尝试）",
+            value=False,
+            help=(
+                "localhost 本机演示通常不需要 STUN。部分校园网或代理环境会阻塞 "
+                "Google STUN，导致一直显示 Connection is taking longer than expected。"
+            )
+        )
         
         try:
             from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
@@ -405,12 +581,14 @@ elif input_mode == "📹 摄像头实时":
             
             # 线程锁，保护 TF 模型调用
             _model_lock = threading.Lock()
+            webrtc_config = get_analysis_config()
             
             class FaceExpressionProcessor(VideoProcessorBase):
                 """WebRTC 视频处理器：逐帧进行人脸检测和表情识别"""
                 
                 def __init__(self):
                     self.recognizer = None
+                    self.config = webrtc_config
                     self._load_model()
                 
                 def _load_model(self):
@@ -430,26 +608,31 @@ elif input_mode == "📹 摄像头实时":
                     
                     try:
                         with _model_lock:
-                            # 人脸检测
-                            faces = detect_faces(img)
-                            
-                            if len(faces) > 0:
-                                # 快速模式识别
-                                results = self.recognizer.recognize_all_fast(img, faces)
-                                
-                                # 绘制结果
-                                img = draw_results(img, results)
+                            analysis = analyze_frame(img, self.recognizer, self.config)
+                            img = analysis["result_image"]
                     except Exception as e:
                         print(f"[WebRTC] 帧处理错误: {e}")
                     
                     return av.VideoFrame.from_ndarray(img, format="bgr24")
             
+            rtc_configuration = (
+                {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+                if use_stun
+                else {"iceServers": []}
+            )
+            webrtc_key = "classroom-webrtc-stun" if use_stun else "classroom-webrtc-local"
+            
             webrtc_streamer(
-                key="classroom-webrtc",
+                key=webrtc_key,
                 mode=WebRtcMode.SENDRECV,
                 video_processor_factory=FaceExpressionProcessor,
+                rtc_configuration=rtc_configuration,
                 media_stream_constraints={
-                    "video": {"width": 640, "height": 480},
+                    "video": {
+                        "width": {"ideal": 640},
+                        "height": {"ideal": 480},
+                        "frameRate": {"ideal": 10, "max": 15},
+                    },
                     "audio": False,
                 },
                 async_processing=True,
@@ -465,109 +648,230 @@ elif input_mode == "📹 摄像头实时":
 # ==================== 检测结果展示 ====================
 if st.session_state.recognition_results is not None:
     st.markdown("---")
-    st.header("📊 检测结果")
-    
-    col_img1, col_img2 = st.columns(2)
-    
-    with col_img1:
-        if st.session_state.current_image is not None:
-            img_rgb = cv2.cvtColor(st.session_state.current_image, cv2.COLOR_BGR2RGB)
-            st.image(img_rgb, caption="原始图片", use_container_width=True)
-    
-    with col_img2:
-        if st.session_state.result_image is not None:
-            result_rgb = cv2.cvtColor(st.session_state.result_image, cv2.COLOR_BGR2RGB)
-            st.image(result_rgb, caption="检测结果（框+表情标注）", use_container_width=True)
-    
-    # 统计信息
-    if st.session_state.stats:
-        st.markdown("---")
-        
-        col_stats, col_state = st.columns([2, 1])
-        
-        with col_stats:
-            st.subheader("📈 表情统计")
-            stats = st.session_state.stats
-            
-            # 显示关键指标
-            metric_cols = st.columns(4)
-            with metric_cols[0]:
-                st.metric("检测人数", stats['total_count'])
-            with metric_cols[1]:
-                st.metric("主要表情", stats['main_expression_cn'])
-            with metric_cols[2]:
-                happy_neutral = stats['expression_ratio']['Happy'] + stats['expression_ratio']['Neutral']
-                st.metric("积极占比", f"{happy_neutral*100:.1f}%")
-            with metric_cols[3]:
-                sad_angry = stats['expression_ratio']['Sad'] + stats['expression_ratio']['Angry']
-                st.metric("低落占比", f"{sad_angry*100:.1f}%")
-            
-            # 表情分布柱状图
-            st.subheader("表情分布")
-            chart_data = pd.DataFrame({
-                '表情': [EXPRESSION_CN_MAP.get(cat, cat) for cat in EXPRESSION_CATEGORIES],
-                '人数': [stats['expression_count'][cat] for cat in EXPRESSION_CATEGORIES],
-                '比例': [stats['expression_ratio'][cat] for cat in EXPRESSION_CATEGORIES],
-            })
-            
-            col_chart1, col_chart2 = st.columns(2)
-            with col_chart1:
-                st.bar_chart(chart_data.set_index('表情')['人数'], use_container_width=True)
-            with col_chart2:
-                st.bar_chart(chart_data.set_index('表情')['比例'], use_container_width=True)
-            
-            # 详细统计表格
-            st.subheader("详细统计")
-            display_df = chart_data.copy()
-            display_df['比例'] = display_df['比例'].apply(lambda x: f"{x*100:.1f}%")
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
-        
-        with col_state:
-            st.subheader("🎯 课堂状态")
-            state_text = st.session_state.state_text
-            state_level = st.session_state.state_level
-            color = get_state_color(state_level)
-            
+
+    if st.session_state.result_mode == "video" and st.session_state.temporal_records:
+        st.header("🎬 视频分析报告")
+
+        summary = st.session_state.video_summary or {}
+        perf = st.session_state.video_performance or {}
+        warning = st.session_state.temporal_warning or {}
+
+        st.caption(
+            "视频统计按采样帧进行：人数指标展示平均每帧人数、峰值人数和人脸实例数，"
+            "不把同一个人跨帧重复出现直接称为“检测人数”。"
+        )
+
+        overview_cols = st.columns(5)
+        with overview_cols[0]:
+            st.metric("采样帧数", summary.get("sampled_frames", 0))
+        with overview_cols[1]:
+            st.metric("平均每帧人数", f"{summary.get('avg_people_per_frame', 0):.2f}")
+        with overview_cols[2]:
+            st.metric("峰值人数", summary.get("max_people_per_frame", 0))
+        with overview_cols[3]:
+            st.metric("人脸实例数", summary.get("face_instances", 0))
+        with overview_cols[4]:
+            st.metric("主要表情", summary.get("main_expression_cn", "无"))
+
+        state_cols = st.columns([2, 1])
+        with state_cols[0]:
+            warning_level = warning.get('level', 'normal')
+            warning_text = (
+                f"{warning.get('level_cn', '正常')}："
+                f"{warning.get('reason', '未触发连续状态预警')}"
+            )
+            if warning_level == 'red':
+                st.error(warning_text)
+            elif warning_level == 'yellow':
+                st.warning(warning_text)
+            elif warning_level == 'green':
+                st.success(warning_text)
+            else:
+                st.info(warning_text)
+        with state_cols[1]:
+            color = get_state_color(summary.get("state_level", "normal"))
             st.markdown(
                 f"""
                 <div style="
                     background-color: {color};
-                    padding: 20px;
+                    padding: 18px;
                     border-radius: 10px;
                     text-align: center;
                     color: white;
-                    font-size: 20px;
+                    font-size: 18px;
                     font-weight: bold;
-                    margin: 10px 0;
                 ">
-                    {state_text}
+                    {summary.get("state_text", "课堂状态一般")}
                 </div>
                 """,
                 unsafe_allow_html=True
             )
-            
-            # 显示各表情详细比例
-            st.markdown("**各类表情比例:**")
-            for cat in EXPRESSION_CATEGORIES:
-                ratio = stats['expression_ratio'][cat]
-                cn_name = EXPRESSION_CN_MAP.get(cat, cat)
-                st.progress(ratio, text=f"{cn_name}: {ratio*100:.1f}%")
-    
-    # 单个人脸详细结果
-    if len(st.session_state.recognition_results) > 0:
-        st.markdown("---")
-        st.subheader("👤 单个人脸识别详情")
-        
-        detail_cols = st.columns(min(len(st.session_state.recognition_results), 4))
-        for i, rec in enumerate(st.session_state.recognition_results[:8]):  # 最多显示8个
-            with detail_cols[i % 4]:
-                label_cn = rec.get('label_cn', '未知')
-                confidence = rec.get('confidence', 0)
-                st.metric(
-                    f"人脸 {i+1}",
-                    f"{label_cn}",
-                    delta=f"置信度 {confidence:.2%}"
+
+        st.subheader("📈 按帧平均表情比例")
+        mean_ratio = summary.get("mean_expression_ratio", {})
+        ratio_df = pd.DataFrame({
+            "表情": [EXPRESSION_CN_MAP.get(cat, cat) for cat in EXPRESSION_CATEGORIES],
+            "平均比例": [mean_ratio.get(cat, 0.0) for cat in EXPRESSION_CATEGORIES],
+        })
+        st.bar_chart(ratio_df.set_index("表情")["平均比例"], use_container_width=True)
+
+        perf_cols = st.columns(4)
+        with perf_cols[0]:
+            st.metric("总耗时", f"{perf.get('total_elapsed_sec', 0):.2f}s")
+        with perf_cols[1]:
+            st.metric("平均每帧耗时", f"{perf.get('avg_elapsed_ms_per_frame', 0):.1f}ms")
+        with perf_cols[2]:
+            st.metric("视频 FPS", perf.get('fps', 0))
+        with perf_cols[3]:
+            st.metric("采样间隔帧", perf.get('sample_interval_frames', 0))
+
+        temporal_df = pd.DataFrame(st.session_state.temporal_records)
+        trend_cols = [f"{cat}_ratio" for cat in EXPRESSION_CATEGORIES if f"{cat}_ratio" in temporal_df.columns]
+        if trend_cols:
+            st.subheader("⏱️ 表情比例时间趋势")
+            chart_df = temporal_df[['time_sec'] + trend_cols].copy()
+            rename_map = {f"{cat}_ratio": EXPRESSION_CN_MAP.get(cat, cat) for cat in EXPRESSION_CATEGORIES}
+            chart_df = chart_df.rename(columns=rename_map)
+            st.line_chart(chart_df.set_index('time_sec'), use_container_width=True)
+
+        keyframes = st.session_state.video_keyframes or []
+        if keyframes:
+            st.subheader("🖼️ 关键采样帧预览")
+            keyframe_cols = st.columns(min(len(keyframes), 3))
+            for i, keyframe in enumerate(keyframes[:6]):
+                with keyframe_cols[i % len(keyframe_cols)]:
+                    image_rgb = cv2.cvtColor(keyframe["image"], cv2.COLOR_BGR2RGB)
+                    record = keyframe["record"]
+                    st.image(
+                        image_rgb,
+                        caption=(
+                            f"{keyframe['label']} | {record.get('time_sec', 0):.1f}s | "
+                            f"{record.get('state_text', '')}"
+                        ),
+                        use_container_width=True,
+                    )
+
+        st.subheader("📋 逐帧时序日志")
+        log_cols = [
+            'sample_index', 'time_sec', 'total_count', 'main_expression_cn',
+            'state_text', 'elapsed_ms'
+        ]
+        available_log_cols = [col for col in log_cols if col in temporal_df.columns]
+        st.dataframe(
+            temporal_df[available_log_cols],
+            use_container_width=True,
+            hide_index=True
+        )
+        if st.session_state.temporal_csv_path:
+            st.caption(f"时序日志已导出到: {st.session_state.temporal_csv_path}")
+            if os.path.exists(st.session_state.temporal_csv_path):
+                with open(st.session_state.temporal_csv_path, "rb") as f:
+                    st.download_button(
+                        "⬇️ 下载时序 CSV",
+                        data=f.read(),
+                        file_name=os.path.basename(st.session_state.temporal_csv_path),
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+
+    else:
+        st.header("📊 检测结果")
+
+        col_img1, col_img2 = st.columns(2)
+
+        with col_img1:
+            if st.session_state.current_image is not None:
+                img_rgb = cv2.cvtColor(st.session_state.current_image, cv2.COLOR_BGR2RGB)
+                st.image(img_rgb, caption="原始图片", use_container_width=True)
+
+        with col_img2:
+            if st.session_state.result_image is not None:
+                result_rgb = cv2.cvtColor(st.session_state.result_image, cv2.COLOR_BGR2RGB)
+                st.image(result_rgb, caption="检测结果（框+表情标注）", use_container_width=True)
+
+        if st.session_state.stats:
+            st.markdown("---")
+
+            col_stats, col_state = st.columns([2, 1])
+
+            with col_stats:
+                st.subheader("📈 表情统计")
+                stats = st.session_state.stats
+
+                metric_cols = st.columns(4)
+                with metric_cols[0]:
+                    st.metric("检测人数", stats['total_count'])
+                with metric_cols[1]:
+                    st.metric("主要表情", stats['main_expression_cn'])
+                with metric_cols[2]:
+                    happy_neutral = stats['expression_ratio']['Happy'] + stats['expression_ratio']['Neutral']
+                    st.metric("积极占比", f"{happy_neutral*100:.1f}%")
+                with metric_cols[3]:
+                    sad_angry = stats['expression_ratio']['Sad'] + stats['expression_ratio']['Angry']
+                    st.metric("低落占比", f"{sad_angry*100:.1f}%")
+
+                st.subheader("表情分布")
+                chart_data = pd.DataFrame({
+                    '表情': [EXPRESSION_CN_MAP.get(cat, cat) for cat in EXPRESSION_CATEGORIES],
+                    '人数': [stats['expression_count'][cat] for cat in EXPRESSION_CATEGORIES],
+                    '比例': [stats['expression_ratio'][cat] for cat in EXPRESSION_CATEGORIES],
+                })
+
+                col_chart1, col_chart2 = st.columns(2)
+                with col_chart1:
+                    st.bar_chart(chart_data.set_index('表情')['人数'], use_container_width=True)
+                with col_chart2:
+                    st.bar_chart(chart_data.set_index('表情')['比例'], use_container_width=True)
+
+                st.subheader("详细统计")
+                display_df = chart_data.copy()
+                display_df['比例'] = display_df['比例'].apply(lambda x: f"{x*100:.1f}%")
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            with col_state:
+                st.subheader("🎯 课堂状态")
+                state_text = st.session_state.state_text
+                state_level = st.session_state.state_level
+                color = get_state_color(state_level)
+
+                st.markdown(
+                    f"""
+                    <div style="
+                        background-color: {color};
+                        padding: 20px;
+                        border-radius: 10px;
+                        text-align: center;
+                        color: white;
+                        font-size: 20px;
+                        font-weight: bold;
+                        margin: 10px 0;
+                    ">
+                        {state_text}
+                    </div>
+                    """,
+                    unsafe_allow_html=True
                 )
+
+                st.markdown("**各类表情比例:**")
+                for cat in EXPRESSION_CATEGORIES:
+                    ratio = stats['expression_ratio'][cat]
+                    cn_name = EXPRESSION_CN_MAP.get(cat, cat)
+                    st.progress(ratio, text=f"{cn_name}: {ratio*100:.1f}%")
+
+        if len(st.session_state.recognition_results) > 0:
+            st.markdown("---")
+            st.subheader("👤 单个人脸识别详情")
+
+            detail_cols = st.columns(min(len(st.session_state.recognition_results), 4))
+            for i, rec in enumerate(st.session_state.recognition_results[:8]):
+                with detail_cols[i % 4]:
+                    label_cn = rec.get('label_cn', '未知')
+                    confidence = rec.get('confidence', 0)
+                    st.metric(
+                        f"人脸 {i+1}",
+                        f"{label_cn}",
+                        delta=f"置信度 {confidence:.2%}"
+                    )
 
 
 # ==================== 历史记录 ====================

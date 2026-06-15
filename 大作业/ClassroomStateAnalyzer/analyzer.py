@@ -134,6 +134,87 @@ def get_state_color(state_level: str) -> str:
     return color_map.get(state_level, '#607D8B')
 
 
+def calculate_temporal_warning(frame_records: List[Dict]) -> Dict:
+    """
+    根据视频逐帧记录计算三级预警。
+
+    规则：
+    - red：连续 3 个采样帧为 low 或 attention
+    - yellow：连续 5 个采样帧 stable 且 Neutral 平均占比 >= 0.65
+    - green：连续 10 个采样帧 good
+    """
+    if not frame_records:
+        return {
+            'level': 'none',
+            'level_cn': '无预警',
+            'reason': '没有可用于时序分析的采样帧',
+            'trigger_frame': None,
+        }
+
+    red_streak = 0
+    good_streak = 0
+    stable_window = []
+    green_trigger = None
+    yellow_trigger = None
+
+    for record in frame_records:
+        state_level = record.get('state_level', 'empty')
+        sample_index = record.get('sample_index')
+
+        if state_level in ('low', 'attention'):
+            red_streak += 1
+        else:
+            red_streak = 0
+
+        if red_streak >= 3:
+            return {
+                'level': 'red',
+                'level_cn': '红色预警',
+                'reason': '连续 3 个采样帧处于低落或注意力波动状态',
+                'trigger_frame': sample_index,
+            }
+
+        if state_level == 'good':
+            good_streak += 1
+            if good_streak >= 10 and green_trigger is None:
+                green_trigger = sample_index
+        else:
+            good_streak = 0
+
+        stable_window.append(record)
+        if len(stable_window) > 5:
+            stable_window.pop(0)
+
+        if len(stable_window) == 5:
+            all_stable = all(r.get('state_level') == 'stable' for r in stable_window)
+            neutral_avg = sum(r.get('Neutral_ratio', 0.0) for r in stable_window) / 5
+            if all_stable and neutral_avg >= 0.65 and yellow_trigger is None:
+                yellow_trigger = sample_index
+
+    if yellow_trigger is not None:
+        return {
+            'level': 'yellow',
+            'level_cn': '黄色预警',
+            'reason': '连续 5 个采样帧课堂平稳但中性占比偏高',
+            'trigger_frame': yellow_trigger,
+        }
+
+    if green_trigger is not None:
+        return {
+            'level': 'green',
+            'level_cn': '绿色状态',
+            'reason': '连续 10 个采样帧课堂状态良好',
+            'trigger_frame': green_trigger,
+        }
+
+    return {
+        'level': 'normal',
+        'level_cn': '正常',
+        'reason': '未触发连续状态预警',
+        'trigger_frame': frame_records[-1].get('sample_index'),
+    }
+
+
 def format_stats_for_display(stats: Dict) -> str:
     """
     将统计信息格式化为可展示的字符串
